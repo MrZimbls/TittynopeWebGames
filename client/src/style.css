@@ -1,0 +1,92 @@
+:root {
+  --text: #1f2937;
+  --text-h: #0f172a;
+  --muted: #64748b;
+  --bg: #f8fafc;
+  --card: #ffffff;
+  --bar: #ffffff;
+  --border: #e2e8f0;
+  --input-bg: #ffffff;
+
+  font-family: system-ui, 'Segoe UI', Roboto, sans-serif;
+  line-height: 1.45;
+  color: var(--text);
+  background: var(--bg);
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --text: #e2e8f0;
+    --text-h: #f8fafc;
+    --muted: #94a3b8;
+    --bg: #0f172a;
+    --card: #1e293b;
+    --bar: #1e293b;
+    --border: #334155;
+    --input-bg: #0f172a;
+  }
+}
+
+body {
+  margin: 0;
+}
+
+#app {
+  min-height: 100vh;
+}
+
+h1,
+h2,
+h3 {
+  color: var(--text-h);
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+}
+
+button.primary,
+button.secondary,
+button.ghost {
+  border-radius: 8px;
+  padding: 0.5rem 0.9rem;
+  border: 1px solid transparent;
+}
+
+button.primary {
+  background: #6366f1;
+  color: #fff;
+  border-color: #4f46e5;
+}
+
+button.primary:hover:not(:disabled) {
+  filter: brightness(1.05);
+}
+
+button.primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button.secondary {
+  background: transparent;
+  color: var(--text);
+  border-color: var(--border);
+}
+
+button.secondary:hover:not(:disabled) {
+  background: rgba(99, 102, 241, 0.08);
+}
+
+button.ghost {
+  background: transparent;
+  color: var(--muted);
+  border-color: transparent;
+}
+
+button.ghost:hover {
+  color: var(--text);
+}
