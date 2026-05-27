@@ -1,7 +1,9 @@
 # WebGames — production image (Vue static + Express/Socket.IO)
 FROM node:22-alpine AS client-build
+WORKDIR /build
+COPY client/package.json client/package-lock.json ./client/
+COPY shared ./shared
 WORKDIR /build/client
-COPY client/package.json client/package-lock.json ./
 RUN npm ci
 COPY client/ ./
 # Empty = same origin as the page (recommended behind one tunnel hostname)
