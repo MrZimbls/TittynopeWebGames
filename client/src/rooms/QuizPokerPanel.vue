@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, toRef } from 'vue'
+import { computed, onMounted, onUnmounted, ref, toRef, watch } from 'vue'
 import type {
   QuizPokerHostAction,
   QuizPokerPhase,
@@ -9,6 +9,7 @@ import type {
 import { isQuizPokerState } from '../../../shared/protocol'
 import { getSocket } from '../socket'
 import { useQuizPokerWebcam } from '../composables/useQuizPokerWebcam'
+import chipIconSrc from '../assets/chip-icon.svg'
 
 const props = defineProps<{
   snapshot: RoomSnapshot
@@ -28,8 +29,6 @@ const poker = computed(() =>
 )
 
 const hostPlayer = computed(() => props.snapshot.players.find((p) => p.isHost) ?? null)
-const contestants = computed(() => props.snapshot.players.filter((p) => !p.isHost))
-
 const playerName = (id: string) => props.snapshot.players.find((p) => p.id === id)?.name ?? id
 
 const initials = (name: string) =>
@@ -61,31 +60,41 @@ const phaseLabel: Record<QuizPokerPhase, string> = {
   hand_complete: 'Hand complete',
 }
 
-/** Seats around the table; current player anchored at bottom (180°). */
+/** Seats around the table; local user anchored at bottom (180°). */
 const ringSeats = computed(() => {
   const order = poker.value?.seatOrder ?? []
-  const n = order.length
+  const st = poker.value
+  if (!st) return []
+
+  const hostId = hostPlayer.value?.id ?? ''
+  // Never place host in the table ring; host is shown via top-left badge only.
+  const seatIds = order
+  const n = seatIds.length
   if (n === 0) return []
-  const myIdx = order.indexOf(props.playerId)
+
+  const myIdx = seatIds.indexOf(props.playerId)
   const base = myIdx >= 0 ? myIdx : 0
-  return order.map((id, i) => {
+  return seatIds.map((id, i) => {
     const rel = (i - base + n) % n
     const deg = 180 + (rel / n) * 360
-    const ps = poker.value?.players[id]
+    const ps = st.players[id]
+    const isHostSeat = id === hostId
     return {
       id,
       deg,
       name: playerName(id),
       isMe: id === props.playerId,
+      isHostSeat,
       chips: ps?.chips ?? 0,
       bet: ps?.betThisRound ?? 0,
       folded: ps?.folded ?? false,
       allIn: ps?.allIn ?? false,
+      blindTag: id === blindSeats.value.sb ? 'SB' : id === blindSeats.value.bb ? 'BB' : null,
       guessSubmitted: ps?.guessSubmitted ?? false,
       guess: ps?.guess,
       isActor:
-        poker.value?.betting?.subPhase === 'action' &&
-        poker.value.betting.seatOrder[poker.value.betting.currentActorIndex] === id,
+        st.betting?.subPhase === 'action' &&
+        st.betting.seatOrder[st.betting.currentActorIndex] === id,
       webcamEnabled: ps?.webcamEnabled ?? false,
     }
   })
@@ -94,16 +103,45 @@ const ringSeats = computed(() => {
 const questionsDraft = ref('')
 const guessDraft = ref('')
 const betAmount = ref(20)
+const bigBlindDraft = ref(20)
 const selectedWinners = ref<string[]>([])
-const chipAdjust = ref<Record<string, string>>({})
-const overrideGuessPlayer = ref('')
-const overrideGuessValue = ref('')
+const editChipPlayerId = ref<string | null>(null)
+const editChipValue = ref('')
+const editGuessPlayerId = ref<string | null>(null)
+const editGuessValue = ref('')
 const hostControlsOpen = ref(props.isHost)
 
 const { webcamOn, toggleWebcam, registerSeatVideo, hasVideo } = useQuizPokerWebcam(
   snapshotRef,
   playerIdRef,
 )
+
+const actionToast = ref<{ id: number; text: string } | null>(null)
+let actionToastTimer: number | null = null
+let actionToastSeq = 0
+
+function showActionToast(text: string) {
+  actionToastSeq += 1
+  actionToast.value = { id: actionToastSeq, text }
+  if (actionToastTimer !== null) {
+    window.clearTimeout(actionToastTimer)
+  }
+  actionToastTimer = window.setTimeout(() => {
+    actionToast.value = null
+  }, 1700)
+}
+
+function onActionToast(payload: { text: string }) {
+  showActionToast(payload.text)
+}
+
+onMounted(() => {
+  socket.on('quiz_poker:action_toast', onActionToast)
+})
+
+onUnmounted(() => {
+  socket.off('quiz_poker:action_toast', onActionToast)
+})
 
 function host(action: QuizPokerHostAction, extra: Record<string, unknown> = {}) {
   if (!props.hostSecret) return
@@ -124,13 +162,25 @@ const isMyTurn = computed(() => {
 
 const potTotal = computed(() => {
   const st = poker.value
-  if (!st?.betting) return 0
-  let t = st.betting.mainPot
-  for (const sp of st.betting.sidePots) t += sp.amount
-  for (const id of st.seatOrder) {
-    t += st.players[id]?.betThisRound ?? 0
-  }
-  return t
+  if (!st) return 0
+  return st.seatOrder.reduce((sum, id) => sum + (st.players[id]?.totalBetHand ?? 0), 0)
+})
+
+const showCenterPot = computed(() => {
+  const st = poker.value
+  if (!st || potTotal.value <= 0) return false
+  const phasesWithPot = new Set([
+    'betting_1',
+    'betting_2',
+    'betting_3',
+    'betting_4',
+    'clue_1',
+    'clue_2',
+    'answer_reveal',
+    'showdown',
+    'hand_complete',
+  ])
+  return phasesWithPot.has(st.phase)
 })
 
 const allGuessesIn = computed(() => {
@@ -139,11 +189,67 @@ const allGuessesIn = computed(() => {
   return st.seatOrder.every((id) => st.players[id]?.guessSubmitted)
 })
 
+const tiedClosestCount = computed(() => {
+  const ranking = poker.value?.closestGuessRanking
+  if (!ranking?.length) return 0
+  const minDist = Math.min(...ranking.map((r) => r.distance))
+  return ranking.filter((r) => r.distance === minDist).length
+})
+
+const hostContinuePrompt = computed(() => {
+  const st = poker.value
+  if (!st?.betting || st.betting.subPhase !== 'round_complete') {
+    return null
+  }
+  const round = st.betting.roundNumber
+  if (round === 1) {
+    return { title: 'Betting round 1 complete', next: 'Reveal clue 1 and continue' }
+  }
+  if (round === 2) {
+    return { title: 'Betting round 2 complete', next: 'Reveal clue 2 and continue' }
+  }
+  if (round === 3) {
+    return { title: 'Betting round 3 complete', next: 'Reveal answer and continue' }
+  }
+  return { title: 'Final betting complete', next: 'Continue to showdown' }
+})
+
+const blindSeats = computed(() => {
+  const st = poker.value
+  if (!st || st.seatOrder.length < 2) {
+    return { sb: null as string | null, bb: null as string | null }
+  }
+
+  const activeOrder = st.seatOrder.filter((id) => {
+    const p = st.players[id]
+    return Boolean(p && (p.chips > 0 || p.betThisRound > 0))
+  })
+  const order = activeOrder.length >= 2 ? activeOrder : st.seatOrder
+  const dealerId = st.seatOrder[st.dealerIndex] ?? order[0]
+  const base = Math.max(0, order.indexOf(dealerId))
+  const sb = order[(base + 1) % order.length] ?? null
+  const bb = order[(base + 2) % order.length] ?? null
+  return { sb, bb }
+})
+
+const actionButtons: Array<'fold' | 'check' | 'call' | 'bet' | 'raise'> = [
+  'fold',
+  'check',
+  'call',
+  'bet',
+  'raise',
+]
+
+function canUseAction(act: 'fold' | 'check' | 'call' | 'bet' | 'raise') {
+  return Boolean(isMyTurn.value && poker.value?.legalActions?.includes(act))
+}
+
 const showGuess = (id: string) => {
   const st = poker.value
   if (!st) return false
   return (
     st.guessesRevealed ||
+    st.revealedGuessPlayerIds.includes(id) ||
     id === props.playerId ||
     props.isHost ||
     st.phase === 'showdown' ||
@@ -168,18 +274,57 @@ function confirmWinners() {
   selectedWinners.value = []
 }
 
-function adjustChips(id: string) {
-  const delta = Number(chipAdjust.value[id] ?? 0)
-  if (!Number.isFinite(delta) || delta === 0) return
-  host('adjust_chips', { playerId: id, chipsDelta: delta })
-  chipAdjust.value = { ...chipAdjust.value, [id]: '0' }
+function openChipEditor(id: string) {
+  const current = poker.value?.players[id]?.chips ?? 0
+  editChipPlayerId.value = id
+  editChipValue.value = String(current)
+}
+
+function saveChipEditor(id: string) {
+  const current = poker.value?.players[id]?.chips ?? 0
+  const next = Math.max(0, Math.floor(Number(editChipValue.value)))
+  if (!Number.isFinite(next)) return
+  const delta = next - current
+  if (delta !== 0) {
+    host('adjust_chips', { playerId: id, chipsDelta: delta })
+  }
+  editChipPlayerId.value = null
+  editChipValue.value = ''
+}
+
+function openGuessEditor(id: string) {
+  const current = poker.value?.players[id]?.guess
+  editGuessPlayerId.value = id
+  editGuessValue.value = current === null || current === undefined ? '' : String(current)
+}
+
+function saveGuessEditor(id: string) {
+  const next = Number(editGuessValue.value)
+  if (!Number.isFinite(next)) return
+  host('set_guess', { playerId: id, guess: next })
+  editGuessPlayerId.value = null
+  editGuessValue.value = ''
+}
+
+function revealGuess(playerId: string) {
+  host('reveal_guess', { playerId })
+}
+
+function setBlinds() {
+  const bb = Math.max(2, Math.floor(Number(bigBlindDraft.value)))
+  host('set_blinds', { bigBlind: bb })
+  bigBlindDraft.value = bb
 }
 
 function seatStyle(deg: number) {
-  const radius = 'min(38vw, 42%)'
+  const rad = (deg * Math.PI) / 180
+  const rx = 42
+  const ry = 33
+  const x = 50 + Math.cos(rad) * rx
+  const y = 50 + Math.sin(rad) * ry
   return {
-    '--seat-deg': `${deg}deg`,
-    '--seat-radius': radius,
+    left: `${x}%`,
+    top: `${y}%`,
   }
 }
 </script>
@@ -188,6 +333,31 @@ function seatStyle(deg: number) {
   <div v-if="poker" class="qp">
     <!-- Round table overlay -->
     <div class="table-stage">
+      <div class="top-right-stack">
+        <div v-if="isHost" class="host-game-state">
+          <span class="host-game-state-label">Game state</span>
+          <span class="hub-phase">{{ phaseLabel[poker.phase] }}</span>
+          <span v-if="poker.betting" class="host-game-state-meta">
+            Betting round {{ poker.betting.roundNumber }}
+            <template v-if="poker.betting.subPhase === 'round_complete'"> · ready to continue</template>
+          </span>
+          <span v-if="hostContinuePrompt" class="host-game-state-hint">
+            {{ hostContinuePrompt.title }} → {{ hostContinuePrompt.next }}
+          </span>
+        </div>
+        <button type="button" class="cam-btn" @click="toggleWebcam">
+          {{ webcamOn ? 'Camera off' : 'Camera on' }}
+        </button>
+      </div>
+
+      <div v-if="hostPlayer" class="leader-badge">
+        <div class="leader-dot">{{ initials(hostPlayer.name) }}</div>
+        <div class="leader-text">
+          <strong>{{ isHost ? 'You' : hostPlayer.name }}</strong>
+          <span>Game leader</span>
+        </div>
+      </div>
+
       <div class="table-felt">
         <div class="table-rail" aria-hidden="true" />
 
@@ -218,35 +388,79 @@ function seatStyle(deg: number) {
               <span v-if="seat.isActor && seat.isMe" class="seat-turn">Your turn</span>
               <span v-else-if="seat.isActor" class="seat-turn acting">Acting</span>
             </div>
+            <span v-if="seat.blindTag" class="blind-pill" :class="{ bb: seat.blindTag === 'BB' }">
+              {{ seat.blindTag }}
+            </span>
             <div class="seat-meta">
-              <span class="seat-name">{{ seat.isMe ? 'You' : seat.name }}</span>
-              <span class="seat-chips">{{ seat.chips }}</span>
+              <span class="seat-name">
+                {{ seat.isMe ? 'You' : seat.name }}<template v-if="seat.isHostSeat && !seat.isMe"> (Host)</template>
+              </span>
+              <span class="seat-chips-row">
+                <span class="seat-chips">
+                  <img :src="chipIconSrc" alt="" class="chip-icon" />
+                  {{ seat.chips }}
+                </span>
+                <button
+                  v-if="isHost"
+                  type="button"
+                  class="inline-tool-btn"
+                  title="Edit chips"
+                  @click="openChipEditor(seat.id)"
+                >
+                  🔧
+                </button>
+              </span>
+              <div v-if="isHost && editChipPlayerId === seat.id" class="inline-editor">
+                <input v-model.number="editChipValue" type="number" min="0" />
+                <button type="button" class="ghost sm" @click="saveChipEditor(seat.id)">Save</button>
+                <button type="button" class="ghost sm" @click="editChipPlayerId = null">Cancel</button>
+              </div>
               <span v-if="seat.folded" class="seat-tag">Fold</span>
               <span v-if="seat.allIn" class="seat-tag">All-in</span>
-              <span v-if="seat.guess !== null && showGuess(seat.id)" class="seat-guess">{{ seat.guess }}</span>
-              <span v-else-if="seat.guessSubmitted" class="seat-guess dim">Locked</span>
+              <span v-if="seat.guess !== null && showGuess(seat.id)" class="seat-guess-row">
+                <span class="seat-guess guess-pill">Guess {{ seat.guess }}</span>
+                <button
+                  v-if="isHost"
+                  type="button"
+                  class="inline-tool-btn"
+                  title="Edit guess"
+                  @click="openGuessEditor(seat.id)"
+                >
+                  🔧
+                </button>
+                <button
+                  v-if="isHost && !poker.guessesRevealed"
+                  type="button"
+                  class="inline-tool-btn"
+                  title="Reveal this guess"
+                  @click="revealGuess(seat.id)"
+                >
+                  👁
+                </button>
+              </span>
+              <span v-else-if="seat.guessSubmitted" class="seat-guess-row">
+                <span class="seat-guess guess-pill dim">Guess locked</span>
+                <button
+                  v-if="isHost && !poker.guessesRevealed"
+                  type="button"
+                  class="inline-tool-btn"
+                  title="Reveal this guess"
+                  @click="revealGuess(seat.id)"
+                >
+                  👁
+                </button>
+              </span>
+              <div v-if="isHost && editGuessPlayerId === seat.id" class="inline-editor">
+                <input v-model.number="editGuessValue" type="number" />
+                <button type="button" class="ghost sm" @click="saveGuessEditor(seat.id)">Save</button>
+                <button type="button" class="ghost sm" @click="editGuessPlayerId = null">Cancel</button>
+              </div>
             </div>
           </div>
         </div>
 
-        <!-- Center hub: host + question -->
+        <!-- Center hub: question + clues -->
         <div class="table-hub">
-          <div v-if="hostPlayer" class="hub-host">
-            <div class="hub-host-avatar host-glow">
-              <video
-                v-if="isHost && webcamOn && hostPlayer"
-                :ref="(el) => registerSeatVideo(hostPlayer!.id, el as HTMLVideoElement | null)"
-                autoplay
-                playsinline
-                muted
-                class="hub-host-video"
-              />
-              <span v-else class="hub-host-initials">{{ initials(hostPlayer.name) }}</span>
-            </div>
-            <span class="hub-host-label">{{ hostPlayer.name }}</span>
-            <span class="hub-host-role">Game leader</span>
-          </div>
-
           <div class="hub-content">
             <p v-if="!activeQuestion" class="hub-waiting">Waiting for a question…</p>
             <template v-else>
@@ -265,21 +479,58 @@ function seatStyle(deg: number) {
             </template>
           </div>
 
-          <div class="hub-status">
-            <span class="hub-phase">{{ phaseLabel[poker.phase] }}</span>
-            <span v-if="potTotal > 0" class="hub-pot">Pot {{ potTotal }}</span>
-            <span v-if="poker.betting && !isHost" class="hub-bet">
-              To call: {{ poker.betting.currentBet }}
-            </span>
+          <div v-if="showCenterPot" class="center-pot-display">
+            <span class="center-pot-label">Pot</span>
+            <span class="center-pot-value">{{ potTotal }}</span>
           </div>
         </div>
+
+        <Transition name="action-toast-fade">
+          <div v-if="actionToast" :key="actionToast.id" class="action-toast">
+            {{ actionToast.text }}
+          </div>
+        </Transition>
       </div>
 
       <div class="table-bar">
-        <button type="button" class="cam-btn" @click="toggleWebcam">
-          {{ webcamOn ? 'Camera off' : 'Camera on' }}
-        </button>
-        <span v-if="isMyTurn" class="turn-pill">Your action</span>
+        <template v-if="!isHost && poker.betting">
+          <span class="turn-pill" :class="{ waiting: !isMyTurn }">
+            {{ isMyTurn ? 'Your action' : 'Waiting...' }}
+          </span>
+          <template v-for="act in actionButtons" :key="`bar-${act}`">
+            <button
+              v-if="act !== 'bet' && act !== 'raise'"
+              type="button"
+              class="table-action-btn"
+              :disabled="!canUseAction(act)"
+              @click="canUseAction(act) ? playerAction(act) : null"
+            >
+              {{ act }}
+            </button>
+          </template>
+
+          <div class="betting-pill" :class="{ disabled: !isMyTurn }">
+            <button
+              type="button"
+              class="table-action-btn betting"
+              :disabled="!canUseAction('bet')"
+              @click="canUseAction('bet') ? playerAction('bet', { amount: betAmount }) : null"
+            >
+              Bet
+            </button>
+            <button
+              type="button"
+              class="table-action-btn betting"
+              :disabled="!canUseAction('raise')"
+              @click="canUseAction('raise') ? playerAction('raise', { amount: betAmount }) : null"
+            >
+              Raise
+            </button>
+            <label class="table-bet-label">
+              <input v-model.number="betAmount" type="number" min="1" :disabled="!isMyTurn" />
+            </label>
+          </div>
+        </template>
       </div>
     </div>
 
@@ -297,32 +548,6 @@ function seatStyle(deg: number) {
       </div>
     </section>
 
-    <section
-      v-if="!isHost && poker.betting?.subPhase === 'action' && poker.legalActions?.length"
-      class="dock card actions"
-    >
-      <h3>Poker action</h3>
-      <div class="action-btns">
-        <button
-          v-for="act in poker.legalActions"
-          :key="act"
-          type="button"
-          class="action-chip"
-          @click="
-            act === 'bet' || act === 'raise'
-              ? playerAction(act, { amount: betAmount })
-              : playerAction(act)
-          "
-        >
-          {{ act }}{{ act === 'bet' || act === 'raise' ? ` ${betAmount}` : '' }}
-        </button>
-      </div>
-      <label v-if="poker.legalActions.includes('bet') || poker.legalActions.includes('raise')" class="bet-label">
-        Amount
-        <input v-model.number="betAmount" type="number" min="1" />
-      </label>
-    </section>
-
     <!-- Host controls -->
     <section v-if="isHost" class="dock card host-dock">
       <button type="button" class="host-toggle" @click="hostControlsOpen = !hostControlsOpen">
@@ -330,28 +555,21 @@ function seatStyle(deg: number) {
       </button>
 
       <div v-show="hostControlsOpen" class="host-inner">
-        <div class="host-block">
-          <h4>Question library</h4>
-          <textarea
-            v-model="questionsDraft"
-            rows="3"
-            placeholder="prompt:answer:clue1:clue2 (one per line)"
-          />
-          <button type="button" class="primary" @click="saveQuestions">Save library</button>
-          <ul v-if="poker.questionLibrary.length" class="q-list">
-            <li v-for="q in poker.questionLibrary" :key="q.id">
-              {{ q.prompt }}
-              <button type="button" class="ghost sm" @click="host('select_question', { questionId: q.id })">
-                Select
-              </button>
-              <button type="button" class="ghost sm" @click="host('remove_question', { questionId: q.id })">
-                Remove
-              </button>
-            </li>
-          </ul>
-        </div>
-
         <div class="host-actions">
+          <div v-if="hostContinuePrompt" class="host-next-prompt">
+            <div class="host-next-text">
+              <strong>{{ hostContinuePrompt.title }}</strong>
+              <span>{{ hostContinuePrompt.next }}</span>
+            </div>
+            <button type="button" class="primary" @click="host('end_betting_round')">Continue</button>
+          </div>
+
+          <label class="blind-control">
+            Big blind
+            <input v-model.number="bigBlindDraft" type="number" min="2" step="1" />
+          </label>
+          <button type="button" @click="setBlinds">Set blinds (SB auto)</button>
+          <span class="blind-readout">Current: SB {{ poker.smallBlind }} / BB {{ poker.bigBlind }}</span>
           <button
             v-if="poker.phase === 'select_question'"
             type="button"
@@ -391,12 +609,33 @@ function seatStyle(deg: number) {
           </button>
         </div>
 
+        <div class="host-block">
+          <h4>Question library</h4>
+          <textarea
+            v-model="questionsDraft"
+            rows="3"
+            placeholder="prompt:answer:clue1:clue2 (one per line)"
+          />
+          <button type="button" class="primary" @click="saveQuestions">Save library</button>
+          <ul v-if="poker.questionLibrary.length" class="q-list">
+            <li v-for="q in poker.questionLibrary" :key="q.id">
+              {{ q.prompt }}
+              <button type="button" class="ghost sm" @click="host('select_question', { questionId: q.id })">
+                Select
+              </button>
+              <button type="button" class="ghost sm" @click="host('remove_question', { questionId: q.id })">
+                Remove
+              </button>
+            </li>
+          </ul>
+        </div>
+
         <div v-if="poker.phase === 'showdown' && poker.closestGuessRanking?.length" class="host-block showdown">
           <h4>Pick winner(s)</h4>
           <ul>
             <li v-for="r in poker.closestGuessRanking" :key="r.playerId">
               {{ playerName(r.playerId) }}: {{ r.guess }} (Δ {{ r.distance }})
-              <span v-if="r.tiedForClosest" class="tag">tied</span>
+              <span v-if="r.tiedForClosest && tiedClosestCount > 1" class="tag">tied</span>
               <label>
                 <input
                   type="checkbox"
@@ -412,38 +651,10 @@ function seatStyle(deg: number) {
           </button>
         </div>
 
-        <details class="host-block overrides">
-          <summary>Overrides</summary>
-          <div v-for="c in contestants" :key="c.id" class="override-row">
-            <span>{{ c.name }}</span>
-            <input v-model="chipAdjust[c.id]" type="number" placeholder="±chips" />
-            <button type="button" class="ghost sm" @click="adjustChips(c.id)">Adjust</button>
-          </div>
-          <div class="override-row">
-            <select v-model="overrideGuessPlayer">
-              <option value="">Player</option>
-              <option v-for="c in contestants" :key="c.id" :value="c.id">{{ c.name }}</option>
-            </select>
-            <input v-model="overrideGuessValue" type="number" placeholder="Guess" />
-            <button
-              type="button"
-              class="ghost sm"
-              @click="
-                host('set_guess', {
-                  playerId: overrideGuessPlayer,
-                  guess: Number(overrideGuessValue),
-                })
-              "
-            >
-              Set guess
-            </button>
-          </div>
-          <button type="button" class="ghost" @click="host('reset_hand')">Reset hand</button>
-        </details>
+        <button type="button" class="ghost" @click="host('reset_hand')">Reset hand</button>
       </div>
     </section>
 
-    <p v-if="!isHost && !hostSecret" class="warn">Reconnect as host with secret to run the table.</p>
   </div>
 </template>
 
@@ -457,6 +668,54 @@ function seatStyle(deg: number) {
 /* --- Table stage --- */
 .table-stage {
   width: 100%;
+  position: relative;
+}
+
+.leader-badge {
+  position: absolute;
+  top: -0.15rem;
+  left: 0.25rem;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.35rem 0.55rem;
+  border-radius: 10px;
+  background: rgba(12, 20, 16, 0.8);
+  border: 1px solid rgba(253, 230, 138, 0.35);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.25);
+}
+
+.leader-dot {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: #fde68a;
+  background: linear-gradient(145deg, #5c3d1e, #2a1810);
+  border: 1px solid rgba(251, 191, 36, 0.6);
+}
+
+.leader-text {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.1;
+}
+
+.leader-text strong {
+  font-size: 0.72rem;
+  color: #fef3c7;
+}
+
+.leader-text span {
+  font-size: 0.62rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: rgba(254, 243, 199, 0.75);
 }
 
 .table-felt {
@@ -530,53 +789,33 @@ function seatStyle(deg: number) {
   z-index: 2;
 }
 
-.hub-host {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 0.2rem;
-  margin-bottom: 0.15rem;
-}
-
-.hub-host-avatar {
-  width: 56px;
-  height: 56px;
-  border-radius: 50%;
-  overflow: hidden;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: linear-gradient(145deg, #5c3d1e, #2a1810);
-  border: 2px solid rgba(251, 191, 36, 0.7);
-}
-
-.host-glow {
-  box-shadow: 0 0 18px rgba(251, 191, 36, 0.35);
-}
-
-.hub-host-video {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-}
-
-.hub-host-initials {
-  font-size: 1.1rem;
-  font-weight: 700;
-  color: #fde68a;
-}
-
-.hub-host-label {
-  font-size: 0.8rem;
+.action-toast {
+  position: absolute;
+  left: 50%;
+  top: 44%;
+  transform: translate(-50%, -50%);
+  z-index: 7;
+  padding: 0.45rem 0.75rem;
+  border-radius: 999px;
+  background: rgba(12, 20, 16, 0.9);
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  color: #f8fafc;
+  font-size: 0.86rem;
   font-weight: 600;
-  color: #fde68a;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+  white-space: nowrap;
 }
 
-.hub-host-role {
-  font-size: 0.65rem;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: rgba(253, 230, 138, 0.65);
+.action-toast-fade-enter-active,
+.action-toast-fade-leave-active {
+  transition: opacity 280ms ease, transform 280ms ease;
+}
+
+.action-toast-fade-enter-from,
+.action-toast-fade-leave-to {
+  opacity: 0;
+  transform: translate(-50%, -35%);
 }
 
 .hub-content {
@@ -624,12 +863,74 @@ function seatStyle(deg: number) {
   color: #fef08a;
 }
 
-.hub-status {
+.top-right-stack {
+  position: absolute;
+  top: -0.15rem;
+  right: 0.25rem;
+  z-index: 6;
   display: flex;
-  flex-wrap: wrap;
-  gap: 0.35rem 0.6rem;
-  justify-content: center;
-  font-size: 0.7rem;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.4rem;
+  max-width: min(220px, 42vw);
+}
+
+.host-game-state {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.25rem;
+  padding: 0.4rem 0.55rem;
+  border-radius: 10px;
+  background: rgba(12, 20, 16, 0.88);
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.25);
+  text-align: right;
+}
+
+.host-game-state-label {
+  font-size: 0.58rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(186, 230, 253, 0.7);
+}
+
+.host-game-state-meta,
+.host-game-state-hint {
+  font-size: 0.62rem;
+  color: rgba(255, 255, 255, 0.65);
+  line-height: 1.25;
+}
+
+.host-game-state-hint {
+  color: #fde68a;
+}
+
+.center-pot-display {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.15rem;
+  margin: 0.35rem 0;
+  padding: 0.35rem 0.9rem;
+  border-radius: 14px;
+  background: rgba(251, 191, 36, 0.22);
+  border: 1px solid rgba(253, 230, 138, 0.45);
+}
+
+.center-pot-label {
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(253, 230, 138, 0.85);
+}
+
+.center-pot-value {
+  font-size: clamp(1.8rem, 3rem, 2.4rem);
+  font-weight: 800;
+  color: #fde68a;
+  line-height: 1;
+  text-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
 }
 
 .hub-phase {
@@ -639,27 +940,12 @@ function seatStyle(deg: number) {
   color: #bae6fd;
 }
 
-.hub-pot {
-  padding: 0.15rem 0.5rem;
-  border-radius: 999px;
-  background: rgba(251, 191, 36, 0.2);
-  color: #fde68a;
-  font-weight: 600;
-}
-
-.hub-bet {
-  color: rgba(255, 255, 255, 0.6);
-}
-
 /* --- Seats on the ring --- */
 .table-seat {
   position: absolute;
-  left: 50%;
-  top: 50%;
-  width: 0;
-  height: 0;
+  width: 1px;
+  height: 1px;
   z-index: 3;
-  transform: rotate(var(--seat-deg)) translateY(calc(-1 * var(--seat-radius))) rotate(calc(-1 * var(--seat-deg)));
 }
 
 .seat-card {
@@ -672,6 +958,7 @@ function seatStyle(deg: number) {
   align-items: center;
   gap: 0.25rem;
   width: clamp(72px, 11vw, 108px);
+  overflow: visible;
 }
 
 .seat-video-wrap {
@@ -730,6 +1017,28 @@ function seatStyle(deg: number) {
   white-space: nowrap;
 }
 
+.blind-pill {
+  position: absolute;
+  top: -6px;
+  right: -8px;
+  z-index: 12;
+  font-size: 0.56rem;
+  padding: 0.14rem 0.38rem;
+  border-radius: 999px;
+  background: rgba(251, 191, 36, 0.98);
+  border: 1px solid rgba(120, 53, 15, 0.7);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+  color: #111827;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+
+.blind-pill.bb {
+  background: rgba(220, 38, 38, 0.98);
+  border-color: rgba(127, 29, 29, 0.8);
+  color: #fff7f7;
+}
+
 .seat-meta {
   display: flex;
   flex-direction: column;
@@ -750,6 +1059,26 @@ function seatStyle(deg: number) {
 
 .seat-chips {
   color: #fde68a;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.28rem;
+  padding: 0.08rem 0.35rem;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.45);
+  border: 1px solid rgba(253, 230, 138, 0.28);
+}
+
+.seat-chips-row,
+.seat-guess-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.chip-icon {
+  width: 0.85rem;
+  height: 0.85rem;
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.45));
 }
 
 .seat-tag {
@@ -762,8 +1091,49 @@ function seatStyle(deg: number) {
   color: #a5f3fc;
 }
 
+.guess-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.08rem 0.35rem;
+  border-radius: 999px;
+  background: rgba(8, 47, 73, 0.55);
+  border: 1px solid rgba(125, 211, 252, 0.34);
+  color: #cffafe;
+}
+
 .seat-guess.dim {
-  color: rgba(255, 255, 255, 0.45);
+  color: rgba(255, 255, 255, 0.72);
+  background: rgba(71, 85, 105, 0.45);
+  border-color: rgba(203, 213, 225, 0.28);
+}
+
+.inline-tool-btn {
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  background: rgba(15, 23, 42, 0.5);
+  color: #e2e8f0;
+  border-radius: 6px;
+  line-height: 1;
+  font-size: 0.68rem;
+  padding: 0.08rem 0.24rem;
+  cursor: pointer;
+}
+
+.inline-tool-btn:hover {
+  background: rgba(30, 41, 59, 0.7);
+}
+
+.inline-editor {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.inline-editor input {
+  width: 4.2rem;
+  padding: 0.15rem 0.3rem;
+  font-size: 0.7rem;
+  border-radius: 6px;
 }
 
 @keyframes pulse-ring {
@@ -780,7 +1150,8 @@ function seatStyle(deg: number) {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 0.75rem;
+  flex-wrap: wrap;
+  gap: 0.55rem;
   margin-top: 0.75rem;
 }
 
@@ -805,6 +1176,70 @@ function seatStyle(deg: number) {
   color: #fff;
   font-size: 0.8rem;
   font-weight: 600;
+}
+
+.turn-pill.waiting {
+  background: rgba(71, 85, 105, 0.8);
+}
+
+.table-action-btn {
+  border: 1px solid rgba(253, 230, 138, 0.35);
+  background: linear-gradient(180deg, rgba(20, 64, 50, 0.96), rgba(10, 38, 30, 0.96));
+  color: #f8fafc;
+  border-radius: 999px;
+  padding: 0.38rem 0.82rem;
+  text-transform: capitalize;
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.table-action-btn:hover:not(:disabled) {
+  background: linear-gradient(180deg, rgba(24, 84, 64, 0.96), rgba(12, 54, 41, 0.96));
+  transform: translateY(-1px);
+}
+
+.table-action-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.table-action-btn.betting {
+  margin: 0;
+}
+
+.betting-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  border-radius: 999px;
+  background: rgba(12, 20, 16, 0.72);
+  border: 1px solid rgba(253, 230, 138, 0.28);
+  padding: 0.24rem 0.35rem 0.24rem 0.3rem;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.03);
+}
+
+.betting-pill.disabled {
+  opacity: 0.75;
+}
+
+.table-bet-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+  background: rgba(12, 20, 16, 0.6);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 999px;
+  padding: 0.2rem 0.45rem;
+}
+
+.table-bet-label input {
+  width: 4.25rem;
+  padding: 0.2rem 0.35rem;
+  border-radius: 6px;
 }
 
 /* --- Dock panels --- */
@@ -867,6 +1302,50 @@ textarea {
   display: flex;
   flex-wrap: wrap;
   gap: 0.5rem;
+  align-items: center;
+}
+
+.host-next-prompt {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.7rem;
+  padding: 0.55rem 0.7rem;
+  border-radius: 10px;
+  background: rgba(56, 189, 248, 0.12);
+  border: 1px solid rgba(56, 189, 248, 0.35);
+}
+
+.host-next-text {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.host-next-text strong {
+  font-size: 0.85rem;
+}
+
+.host-next-text span {
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.blind-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+}
+
+.blind-control input {
+  width: 6rem;
+}
+
+.blind-readout {
+  font-size: 0.8rem;
+  color: var(--muted);
 }
 
 .q-list {
@@ -922,6 +1401,11 @@ button.sm {
   text-transform: capitalize;
 }
 
+.action-chip:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .bet-label {
   display: flex;
   align-items: center;
@@ -930,22 +1414,19 @@ button.sm {
   font-size: 0.85rem;
 }
 
+.turn-hint {
+  margin: 0 0 0.45rem;
+  font-size: 0.85rem;
+  color: #86efac;
+}
+
+.turn-hint.waiting {
+  color: var(--muted);
+}
+
 .tag {
   font-size: 0.75rem;
   color: #fbbf24;
-}
-
-.override-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-  align-items: center;
-  margin-bottom: 0.5rem;
-}
-
-.overrides summary {
-  cursor: pointer;
-  font-weight: 600;
 }
 
 .warn {
@@ -966,11 +1447,6 @@ select {
   .table-hub {
     width: 58%;
     padding: 0.65rem;
-  }
-
-  .hub-host-avatar {
-    width: 44px;
-    height: 44px;
   }
 
   .seat-card {

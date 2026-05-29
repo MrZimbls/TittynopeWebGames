@@ -60,6 +60,25 @@ describe('applyBettingAction', () => {
     expect(result).not.toBeNull()
     expect(result!.players[actor]?.folded).toBe(true)
   })
+
+  it('gives big blind closing action in round 1', () => {
+    const seatOrder = ['a', 'b']
+    let players: Record<string, QuizPokerPlayerState> = {
+      a: seat('a', 100),
+      b: seat('b', 100),
+    }
+    let betting = createBettingRound(seatOrder, 0, 1)
+    ;({ players, betting } = postBlinds(players, betting, DEFAULT_SMALL_BLIND, DEFAULT_BIG_BLIND))
+
+    // First to act should be small blind.
+    expect(betting.currentActorIndex).toBe(1)
+    const sbId = betting.seatOrder[betting.currentActorIndex]!
+    const sbResult = applyBettingAction(players, betting, sbId, 'call')
+    expect(sbResult).not.toBeNull()
+    // After SB calls, BB still gets their option (check/raise) before round ends.
+    expect(sbResult!.betting.subPhase).toBe('action')
+    expect(sbResult!.betting.currentActorIndex).toBe(0)
+  })
 })
 
 describe('collectBetsToPot and award', () => {

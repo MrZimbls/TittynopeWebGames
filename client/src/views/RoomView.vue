@@ -21,6 +21,7 @@ const closed = ref('')
 const inRoom = ref(false)
 const pending = ref(true)
 const joinName = ref(session.displayName)
+const copied = ref(false)
 
 const socket = getSocket()
 
@@ -148,13 +149,31 @@ onBeforeUnmount(() => {
 function leave() {
   void router.push('/')
 }
+
+async function copyRoomCode() {
+  try {
+    await navigator.clipboard.writeText(code.value)
+    copied.value = true
+    window.setTimeout(() => {
+      copied.value = false
+    }, 1400)
+  } catch {
+    copied.value = false
+  }
+}
 </script>
 
 <template>
   <div class="room">
     <header class="room-head">
       <div>
-        <h1>Room {{ code }}</h1>
+        <h1>
+          <button type="button" class="room-code-btn" @click="copyRoomCode" title="Copy room code">
+            Room {{ code }}
+            <span class="copy-icon" aria-hidden="true">📋</span>
+          </button>
+          <span v-if="copied" class="copied-pill">Copied</span>
+        </h1>
         <p v-if="snapshot" class="meta">
           Mode:
           <strong>{{
@@ -233,6 +252,41 @@ function leave() {
 h1 {
   margin: 0;
   font-size: 1.35rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.room-code-btn {
+  border: none;
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.room-code-btn:hover .copy-icon {
+  transform: translateY(-1px);
+}
+
+.copy-icon {
+  font-size: 0.95rem;
+  opacity: 0.75;
+  transition: transform 120ms ease, opacity 120ms ease;
+}
+
+.copied-pill {
+  font-size: 0.74rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  color: #dcfce7;
+  background: rgba(22, 163, 74, 0.25);
+  border: 1px solid rgba(22, 163, 74, 0.4);
 }
 
 .meta {

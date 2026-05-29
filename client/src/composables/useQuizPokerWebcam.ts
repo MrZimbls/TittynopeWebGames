@@ -70,6 +70,8 @@ export function useQuizPokerWebcam(snapshot: Ref<RoomSnapshot | null>, playerId:
       remoteStreams.value = new Map(remoteStreams.value)
       attachStreamToSeat(remoteId, stream)
     }
+    // Allow receiving remote camera even before local camera is enabled.
+    pc.addTransceiver('video', { direction: 'recvonly' })
     peers.set(remoteId, { pc })
     return pc
   }
@@ -96,18 +98,22 @@ export function useQuizPokerWebcam(snapshot: Ref<RoomSnapshot | null>, playerId:
   async function connectToPeers() {
     const snap = snapshot.value
     const st = pokerState()
-    const stream = localStream.value
-    if (!snap || !stream) return
+    if (!snap) return
 
     for (const p of snap.players) {
       if (p.id === playerId.value) continue
       if (peers.has(p.id)) continue
       const ps = p.isHost ? null : st?.players[p.id]
-      if (!p.isHost && !ps?.webcamEnabled && !webcamOn.value) continue
+      const remoteCameraOn = p.isHost ? false : Boolean(ps?.webcamEnabled)
+      // Create mesh peers when either side has camera enabled so streams can propagate to everyone.
+      if (!webcamOn.value && !remoteCameraOn) continue
 
       const pc = createPc(p.id)
-      stream.getTracks().forEach((t) => pc.addTrack(t, stream))
-      if (playerId.value < p.id) {
+      const stream = localStream.value
+      if (stream) {
+        stream.getTracks().forEach((t) => pc.addTrack(t, stream))
+      }
+      if (webcamOn.value || playerId.value < p.id) {
         const offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
         socket.emit('quiz_poker:webrtc_signal', { toPlayerId: p.id, signal: offer })
@@ -162,7 +168,7 @@ export function useQuizPokerWebcam(snapshot: Ref<RoomSnapshot | null>, playerId:
   watch(
     () => snapshot.value?.version,
     () => {
-      if (webcamOn.value) void connectToPeers()
+      void connectToPeers()
     },
   )
 

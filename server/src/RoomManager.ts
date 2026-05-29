@@ -328,6 +328,7 @@ export class RoomManager {
         playerIds?: string[]
         playerId?: string
         chipsDelta?: number
+        bigBlind?: number
         guess?: number
         phase?: string
         mainPot?: number
@@ -631,9 +632,49 @@ export class RoomManager {
     })
     if (next === before) return
 
+    this.emitQuizPokerActionToast(ctx.room, before, next, ctx.playerId)
+
     ctx.room.quizPoker = next
     this.bump(ctx.room)
     this.broadcastState(ctx.room)
+  }
+
+  private emitQuizPokerActionToast(
+    room: InternalRoom,
+    before: QuizPokerState,
+    next: QuizPokerState,
+    actorId: string,
+  ): void {
+    if (!before.betting || !next.betting || before.betting.subPhase !== 'action') return
+    const name = room.players.get(actorId)?.name ?? actorId
+    const prevActor = before.players[actorId]
+    const nextActor = next.players[actorId]
+    if (!prevActor || !nextActor) return
+
+    let text: string | null = null
+    if (!prevActor.folded && nextActor.folded) {
+      text = `${name} folded`
+    } else {
+      const putIn = Math.max(0, prevActor.chips - nextActor.chips)
+      if (putIn > 0) {
+        const toCall = Math.max(0, before.betting.currentBet - prevActor.betThisRound)
+        const newCurrentBet = next.betting.currentBet
+        if (newCurrentBet > before.betting.currentBet) {
+          const verb = before.betting.currentBet === 0 ? 'bet' : 'raised to'
+          text = `${name} ${verb} ${newCurrentBet}`
+        } else if (toCall > 0) {
+          text = `${name} called ${putIn}`
+        } else {
+          text = `${name} put in ${putIn}`
+        }
+      } else if (
+        before.betting.currentBet === next.betting.currentBet &&
+        prevActor.betThisRound === nextActor.betThisRound
+      ) {
+        text = `${name} checked`
+      }
+    }
+    if (text) this.io.to(room.code).emit('quiz_poker:action_toast', { text })
   }
 
   private handleQuizPokerHost(
@@ -646,6 +687,7 @@ export class RoomManager {
       playerIds?: string[]
       playerId?: string
       chipsDelta?: number
+      bigBlind?: number
       guess?: number
       phase?: string
       mainPot?: number
@@ -669,10 +711,12 @@ export class RoomManager {
       'reveal_clue_1',
       'reveal_clue_2',
       'reveal_answer',
+      'reveal_guess',
       'reveal_guesses',
       'confirm_winner',
       'next_hand',
       'adjust_chips',
+      'set_blinds',
       'set_guess',
       'force_phase',
       'force_pot',
@@ -705,6 +749,14 @@ export class RoomManager {
         action,
         playerId: targetId,
         chipsDelta: payload.chipsDelta,
+      }
+    } else if (action === 'set_blinds') {
+      const bb = Number(payload.bigBlind)
+      if (!Number.isFinite(bb)) return
+      event = {
+        kind: 'host',
+        action,
+        bigBlind: bb,
       }
     } else if (action === 'set_guess') {
       const targetId = String(payload.playerId ?? '')

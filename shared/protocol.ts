@@ -96,6 +96,12 @@ export interface BettingRoundState {
   currentBet: number
   minRaise: number
   lastAggressorIndex: number | null
+  /** Big blind seat index for round 1 (for closing action) */
+  bigBlindSeatIndex?: number
+  /** True until big blind has had their closing preflop action */
+  bigBlindOptionPending?: boolean
+  /** For zero-bet rounds: remaining players that must act before round can close */
+  pendingChecks?: number
   /** Sum committed this hand (main + side pots building) */
   mainPot: number
   sidePots: SidePot[]
@@ -116,6 +122,8 @@ export interface QuizPokerState {
   clue2Revealed: boolean
   answerRevealed: boolean
   guessesRevealed: boolean
+  /** Player ids whose guesses are manually revealed by host */
+  revealedGuessPlayerIds: string[]
   seatOrder: string[]
   dealerIndex: number
   players: Record<string, QuizPokerPlayerState>
@@ -153,10 +161,12 @@ export type QuizPokerHostAction =
   | 'reveal_clue_1'
   | 'reveal_clue_2'
   | 'reveal_answer'
+  | 'reveal_guess'
   | 'reveal_guesses'
   | 'confirm_winner'
   | 'next_hand'
   | 'adjust_chips'
+  | 'set_blinds'
   | 'set_guess'
   | 'force_phase'
   | 'force_pot'
@@ -170,6 +180,7 @@ export interface QuizPokerHostPayload {
   playerIds?: string[]
   playerId?: string
   chipsDelta?: number
+  bigBlind?: number
   guess?: number
   phase?: QuizPokerPhase
   mainPot?: number

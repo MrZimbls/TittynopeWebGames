@@ -31,6 +31,7 @@ export function createQuizPokerState(): QuizPokerState {
     clue2Revealed: false,
     answerRevealed: false,
     guessesRevealed: false,
+    revealedGuessPlayerIds: [],
     seatOrder: [],
     dealerIndex: 0,
     players: {},
@@ -82,8 +83,12 @@ export function rankGuesses(
   }
   if (entries.length === 0) return []
   const minDist = Math.min(...entries.map((e) => e.distance))
+  const closestCount = entries.filter((e) => e.distance === minDist).length
   return entries
-    .map((e) => ({ ...e, tiedForClosest: e.distance === minDist }))
+    .map((e) => ({
+      ...e,
+      tiedForClosest: closestCount > 1 && e.distance === minDist,
+    }))
     .sort((a, b) => a.distance - b.distance || a.guess - b.guess)
 }
 
@@ -108,6 +113,7 @@ export function filterQuizPokerForViewer(
     const showGuess =
       isHost ||
       state.guessesRevealed ||
+      state.revealedGuessPlayerIds.includes(id) ||
       id === viewerId ||
       state.phase === 'showdown' ||
       state.phase === 'hand_complete'
@@ -190,18 +196,93 @@ function resetHandPlayerState(players: Record<string, QuizPokerPlayerState>): Re
   return next
 }
 
+function clearRoundState(state: QuizPokerState): QuizPokerState {
+  return {
+    ...state,
+    clue1Revealed: false,
+    clue2Revealed: false,
+    answerRevealed: false,
+    guessesRevealed: false,
+    revealedGuessPlayerIds: [],
+    betting: null,
+    closestGuessRanking: undefined,
+    players: resetHandPlayerState(state.players),
+  }
+}
+
+function nthActiveSeatAfter(
+  seatOrder: string[],
+  players: Record<string, QuizPokerPlayerState>,
+  fromIndex: number,
+  nth: number,
+): number {
+  const n = seatOrder.length
+  let count = 0
+  for (let step = 1; step <= n * 2; step++) {
+    const idx = (fromIndex + step) % n
+    const id = seatOrder[idx]!
+    const p = players[id]
+    if (!p || p.folded || p.allIn) continue
+    if (p.chips === 0 && p.betThisRound === 0) continue
+    count++
+    if (count === nth) return idx
+  }
+  return (fromIndex + 1) % Math.max(1, n)
+}
+
+function countCheckEligiblePlayers(
+  seatOrder: string[],
+  players: Record<string, QuizPokerPlayerState>,
+): number {
+  return seatOrder.filter((id) => {
+    const p = players[id]
+    return Boolean(p && !p.folded && !p.allIn && p.chips > 0)
+  }).length
+}
+
 function startBettingRound(state: QuizPokerState, round: 1 | 2 | 3 | 4): QuizPokerState {
   if (state.seatOrder.length < 2) return state
   const players = resetRoundBets(state.players)
-  const betting = createBettingRound(state.seatOrder, state.dealerIndex, round)
+  let betting = createBettingRound(state.seatOrder, state.dealerIndex, round)
   let next: QuizPokerState = {
     ...state,
     phase: bettingPhaseForRound(round),
     players,
     betting,
   }
-  const posted = postBlinds(next.players, next.betting!, state.smallBlind, state.bigBlind)
-  return { ...next, players: posted.players, betting: posted.betting }
+
+  if (round === 1) {
+    const posted = postBlinds(next.players, next.betting!, state.smallBlind, state.bigBlind)
+    return { ...next, players: posted.players, betting: posted.betting }
+  }
+
+  const bbIdx = nthActiveSeatAfter(next.seatOrder, next.players, next.dealerIndex, 2)
+  const firstActorIdx = nthActiveSeatAfter(next.seatOrder, next.players, bbIdx, 1)
+  const pendingChecks = countCheckEligiblePlayers(next.seatOrder, next.players)
+
+  betting = {
+    ...betting,
+    subPhase: 'action',
+    currentBet: 0,
+    minRaise: state.bigBlind,
+    currentActorIndex: firstActorIdx,
+    lastAggressorIndex: null,
+    pendingChecks,
+  }
+  return { ...next, betting }
+}
+
+function shouldEndHandEarly(state: QuizPokerState): boolean {
+  const active = state.seatOrder
+    .map((id) => state.players[id])
+    .filter((p): p is QuizPokerPlayerState => Boolean(p))
+    .filter((p) => !p.folded)
+
+  // Everyone except one folded.
+  if (active.length <= 1) return true
+
+  // No remaining betting decisions (all remaining players all-in / out of chips).
+  return active.every((p) => p.allIn || p.chips <= 0)
 }
 
 export type QuizPokerEvent =
@@ -215,6 +296,7 @@ export type QuizPokerEvent =
       playerIds?: string[]
       playerId?: string
       chipsDelta?: number
+      bigBlind?: number
       guess?: number
       phase?: QuizPokerPhase
       mainPot?: number
@@ -292,25 +374,17 @@ function reduceHostAction(
     const q = state.questionLibrary.find((x) => x.id === event.questionId)
     if (!q) return state
     return {
-      ...state,
+      ...clearRoundState(state),
       phase: 'select_question',
       activeQuestionId: q.id,
-      clue1Revealed: false,
-      clue2Revealed: false,
-      answerRevealed: false,
-      guessesRevealed: false,
-      betting: null,
-      closestGuessRanking: undefined,
     }
   }
 
   if (action === 'start_guessing') {
     if (!activeQuestion(state)) return state
     return {
-      ...state,
+      ...clearRoundState(state),
       phase: 'guessing',
-      players: resetHandPlayerState(state.players),
-      betting: null,
     }
   }
 
@@ -331,6 +405,24 @@ function reduceHostAction(
     if (!state.betting) return state
     const collected = collectBetsToPot(state.players, state.betting)
     let next: QuizPokerState = { ...state, players: collected.players, betting: collected.betting }
+    if (shouldEndHandEarly(next)) {
+      const q = activeQuestion(next)
+      const ranking = q ? rankGuesses(next.players, next.seatOrder, q.answer) : []
+      const pots = buildSidePots(next.seatOrder, next.players, next.betting?.mainPot ?? 0)
+      return {
+        ...next,
+        phase: 'showdown',
+        clue1Revealed: true,
+        clue2Revealed: true,
+        answerRevealed: true,
+        // Keep guesses hidden unless host explicitly reveals them.
+        guessesRevealed: false,
+        betting: next.betting
+          ? { ...next.betting, mainPot: pots.mainPot, sidePots: pots.sidePots }
+          : null,
+        closestGuessRanking: ranking,
+      }
+    }
     const round = state.betting.roundNumber
     if (round === 1) return { ...next, phase: 'clue_1', betting: null }
     if (round === 2) return { ...next, phase: 'clue_2', betting: null }
@@ -360,8 +452,18 @@ function reduceHostAction(
   if (action === 'reveal_answer') {
     return { ...state, answerRevealed: true }
   }
+  if (action === 'reveal_guess' && event.playerId) {
+    if (!state.seatOrder.includes(event.playerId)) return state
+    const nextIds = state.revealedGuessPlayerIds.includes(event.playerId)
+      ? state.revealedGuessPlayerIds
+      : [...state.revealedGuessPlayerIds, event.playerId]
+    return {
+      ...state,
+      revealedGuessPlayerIds: nextIds,
+    }
+  }
   if (action === 'reveal_guesses') {
-    return { ...state, guessesRevealed: true }
+    return { ...state, guessesRevealed: true, revealedGuessPlayerIds: [...state.seatOrder] }
   }
 
   if (action === 'confirm_winner' && event.playerIds?.length) {
@@ -384,17 +486,10 @@ function reduceHostAction(
     const dealerIndex =
       state.seatOrder.length > 0 ? (state.dealerIndex + 1) % state.seatOrder.length : 0
     return {
-      ...state,
+      ...clearRoundState(state),
       phase: 'lobby',
       activeQuestionId: null,
-      clue1Revealed: false,
-      clue2Revealed: false,
-      answerRevealed: false,
-      guessesRevealed: false,
       dealerIndex,
-      betting: null,
-      closestGuessRanking: undefined,
-      players: resetHandPlayerState(state.players),
     }
   }
 
@@ -403,6 +498,12 @@ function reduceHostAction(
     if (!p) return state
     const chips = Math.max(0, p.chips + Math.floor(event.chipsDelta))
     return { ...state, players: { ...state.players, [event.playerId]: { ...p, chips } } }
+  }
+
+  if (action === 'set_blinds' && event.bigBlind !== undefined) {
+    const bb = Math.max(2, Math.floor(event.bigBlind))
+    const sb = Math.max(1, Math.floor(bb / 2))
+    return { ...state, bigBlind: bb, smallBlind: sb }
   }
 
   if (action === 'set_guess' && event.playerId && event.guess !== undefined) {
@@ -432,16 +533,9 @@ function reduceHostAction(
 
   if (action === 'reset_hand') {
     return {
-      ...state,
+      ...clearRoundState(state),
       phase: 'lobby',
       activeQuestionId: null,
-      clue1Revealed: false,
-      clue2Revealed: false,
-      answerRevealed: false,
-      guessesRevealed: false,
-      betting: null,
-      closestGuessRanking: undefined,
-      players: resetHandPlayerState(state.players),
     }
   }
 

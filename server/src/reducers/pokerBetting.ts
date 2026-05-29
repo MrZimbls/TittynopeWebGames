@@ -53,6 +53,9 @@ export function createBettingRound(
     currentBet: 0,
     minRaise: DEFAULT_BIG_BLIND,
     lastAggressorIndex: null,
+    bigBlindSeatIndex: undefined,
+    bigBlindOptionPending: false,
+    pendingChecks: undefined,
     mainPot: 0,
     sidePots: [],
   }
@@ -90,7 +93,15 @@ export function postBlinds(
 
   const bbId = betting.seatOrder[bbIdx]!
   const currentBet = nextPlayers[bbId]?.betThisRound ?? bigBlind
-  let firstActor = findNextActor(betting.seatOrder, nextPlayers, bbIdx, currentBet, betting.lastAggressorIndex)
+  let firstActor = findNextActor(
+    betting.seatOrder,
+    nextPlayers,
+    bbIdx,
+    currentBet,
+    betting.lastAggressorIndex,
+    bbIdx,
+    true,
+  )
 
   return {
     players: nextPlayers,
@@ -101,6 +112,8 @@ export function postBlinds(
       minRaise: bigBlind,
       currentActorIndex: firstActor ?? ((bbIdx + 1) % betting.seatOrder.length),
       lastAggressorIndex: bbIdx,
+      bigBlindSeatIndex: bbIdx,
+      bigBlindOptionPending: true,
     },
   }
 }
@@ -111,6 +124,8 @@ function findNextActor(
   fromIndex: number,
   currentBet: number,
   lastAggressorIndex: number | null,
+  bigBlindSeatIndex?: number,
+  bigBlindOptionPending?: boolean,
 ): number | null {
   const len = seatOrder.length
   for (let step = 1; step <= len; step++) {
@@ -118,6 +133,12 @@ function findNextActor(
     const id = seatOrder[idx]!
     const p = players[id]
     if (!p || p.folded || p.allIn) continue
+    if (currentBet === 0 && lastAggressorIndex === null) {
+      return idx
+    }
+    if (bigBlindOptionPending && bigBlindSeatIndex !== undefined && idx === bigBlindSeatIndex) {
+      return idx
+    }
     if (p.betThisRound < currentBet) return idx
     if (p.chips > 0 && lastAggressorIndex !== null && idx !== lastAggressorIndex) {
       if (p.betThisRound >= currentBet) return idx
@@ -180,6 +201,8 @@ function bettingRoundComplete(
 ): boolean {
   const active = countActivePlayers(players, betting.seatOrder)
   if (active <= 1) return true
+  if (betting.bigBlindOptionPending) return false
+  if (betting.pendingChecks !== undefined) return betting.pendingChecks <= 0
 
   const needsAction = betting.seatOrder.filter((id) => {
     const p = players[id]
@@ -230,6 +253,8 @@ function advanceAfterAction(
     actedIndex,
     betting.currentBet,
     betting.lastAggressorIndex,
+    betting.bigBlindSeatIndex,
+    betting.bigBlindOptionPending,
   )
 
   if (nextIdx === null) {
@@ -256,7 +281,16 @@ export function applyBettingAction(
   if (!p) return null
 
   let nextPlayers = { ...players }
-  let nextBetting = { ...betting }
+  let nextBetting = {
+    ...betting,
+    bigBlindOptionPending:
+      betting.bigBlindOptionPending && betting.bigBlindSeatIndex === idx
+        ? false
+        : betting.bigBlindOptionPending,
+  }
+  if (nextBetting.pendingChecks !== undefined && (action === 'check' || action === 'fold' || action === 'call')) {
+    nextBetting.pendingChecks = Math.max(0, nextBetting.pendingChecks - 1)
+  }
   const toCall = betting.currentBet - p.betThisRound
 
   if (action === 'fold') {
@@ -276,6 +310,7 @@ export function applyBettingAction(
       currentBet: np.betThisRound,
       minRaise: bigBlind,
       lastAggressorIndex: idx,
+      pendingChecks: undefined,
     }
   } else if (action === 'raise') {
     const minTotal = betting.currentBet + betting.minRaise
@@ -294,6 +329,7 @@ export function applyBettingAction(
         currentBet: np.betThisRound,
         minRaise: Math.max(nextBetting.minRaise, raiseSize),
         lastAggressorIndex: idx,
+        pendingChecks: undefined,
       }
     }
   }
