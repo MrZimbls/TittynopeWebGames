@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, toRef, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, toRef } from 'vue'
 import type {
   QuizPokerHostAction,
   QuizPokerPhase,
